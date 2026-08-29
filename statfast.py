@@ -7,6 +7,11 @@ Four pull modes, all sharing one fetch/flatten core:
     pitcher_game("Skubal", game_date="2024-06-01")   one pitcher, one game
     mlb_day("2024-06-01")                            every pitch on a date
 
+The two season pulls also accept an explicit date range instead of seasons:
+
+    mlb_season(start="2024-06-01", end="2024-06-30")
+    pitcher_season("Skubal", start="2024-06-01", end="2024-07-31")
+
 Uses gzip, field-filtered JSON and a thread pool; roughly 6x faster and 6x
 lighter than the Baseball Savant CSV export.
 """
@@ -85,6 +90,43 @@ def _seasons(value: int | str | Iterable[int]) -> tuple[int, ...]:
     return tuple(int(v) for v in value)
 
 
+def _years(start: str, end: str) -> tuple[int, ...]:
+    """Every calendar year touched by a date range."""
+    return tuple(range(int(str(start)[:4]), int(str(end)[:4]) + 1))
+
+
+def _year_chunks(start: str, end: str) -> tuple[tuple[str, str], ...]:
+    """Split a date range at calendar-year boundaries.
+
+    The schedule endpoint silently truncates a multi-year range to its first
+    season, so each year has to be asked for separately.
+    """
+    return tuple((max(str(start), f"{y}-01-01"), min(str(end), f"{y}-12-31"))
+                 for y in _years(start, end))
+
+
+def _in_range(games: dict[int, str], start: str | None,
+              end: str | None) -> dict[int, str]:
+    """Trim a gamePk -> date map to an inclusive date range."""
+    if start is None:
+        return games
+    return {pk: d for pk, d in games.items() if str(start) <= d <= str(end)}
+
+
+def _check_span(seasons, start, end) -> None:
+    """Require exactly one of seasons=... or start=/end=."""
+    if (seasons is None) == (start is None):
+        raise ValueError("pass either seasons=... or both start= and end=")
+    if (start is None) != (end is None):
+        raise ValueError("start= and end= must be given together")
+
+
+def _span_label(seasons, start, end) -> str:
+    if seasons is None:
+        return f"{start}..{end}"
+    return ", ".join(str(y) for y in _seasons(seasons))
+
+
 # ---------------------------------------------------------------------------
 # game discovery
 # ---------------------------------------------------------------------------
@@ -108,6 +150,33 @@ def _schedule(s: requests.Session, params: dict) -> dict[int, str]:
     return {g["gamePk"]: d["date"]
             for d in dates for g in d["games"]
             if g.get("status", {}).get("codedGameState") == "F"}
+
+
+def _mlb_queries(seasons, start, end, game_type: str) -> list[dict]:
+    """Schedule queries covering the requested span, one per season/year."""
+    if seasons is not None:
+        return [{"season": y, "gameType": game_type} for y in _seasons(seasons)]
+    return [{"startDate": a, "endDate": b, "gameType": game_type}
+            for a, b in _year_chunks(start, end)]
+
+
+def _mlb_games(s: requests.Session, seasons, start, end,
+               game_type: str) -> dict[int, str]:
+    """Every played game in the requested span."""
+    games: dict[int, str] = {}
+    for q in _mlb_queries(seasons, start, end, game_type):
+        games |= _schedule(s, q)
+    return _in_range(games, start, end)
+
+
+def _pitcher_span_games(s: requests.Session, pid: int, seasons, start, end,
+                        game_type: str) -> dict[int, str]:
+    """Every game the pitcher appeared in across the requested span."""
+    years = _seasons(seasons) if seasons is not None else _years(start, end)
+    games: dict[int, str] = {}
+    for year in years:
+        games |= _pitcher_games(s, pid, year, game_type)
+    return _in_range(games, start, end)
 
 
 def _pitcher_games(s: requests.Session, pitcher_id: int, season: int,
@@ -245,33 +314,34 @@ def resolve_pitcher(name: str | int, season: int | None = None,
 # pull modes
 # ---------------------------------------------------------------------------
 
-def mlb_season(seasons: int | Iterable[int], *, game_type: str = "R",
-               workers: int = 12,
+def mlb_season(seasons: int | Iterable[int] | None = None, *,
+               start: str | None = None, end: str | None = None,
+               game_type: str = "R", workers: int = 12,
                session: requests.Session | None = None) -> pd.DataFrame:
-    """Every tracked pitch thrown in one or more full seasons."""
+    """Every tracked pitch in whole seasons, or between two dates."""
+    _check_span(seasons, start, end)
     s = session or _session(workers)
-    years = _seasons(seasons)
-    games: dict[int, str] = {}
-    for year in years:
-        games |= _schedule(s, {"season": year, "gameType": game_type})
+    games = _mlb_games(s, seasons, start, end, game_type)
     df = _collect(s, games, None, workers)
-    df.attrs.update(scope="mlb_season", seasons=years, game_type=game_type)
+    df.attrs.update(scope="mlb_season", span=_span_label(seasons, start, end),
+                    start=start, end=end, game_type=game_type)
     return df
 
 
-def pitcher_season(pitcher: str | int, seasons: int | Iterable[int], *,
+def pitcher_season(pitcher: str | int,
+                   seasons: int | Iterable[int] | None = None, *,
+                   start: str | None = None, end: str | None = None,
                    game_type: str = "R", workers: int = 12,
                    session: requests.Session | None = None) -> pd.DataFrame:
-    """Every tracked pitch by one pitcher across one or more full seasons."""
+    """Every tracked pitch by one pitcher, in whole seasons or between dates."""
+    _check_span(seasons, start, end)
     s = session or _session(workers)
     pid, full = resolve_pitcher(pitcher, session=s)
-    years = _seasons(seasons)
-    games: dict[int, str] = {}
-    for year in years:
-        games |= _pitcher_games(s, pid, year, game_type)
+    games = _pitcher_span_games(s, pid, seasons, start, end, game_type)
     df = _collect(s, games, pid, workers)
     df.attrs.update(scope="pitcher_season", pitcher_id=pid, pitcher_name=full,
-                    seasons=years, game_type=game_type)
+                    span=_span_label(seasons, start, end),
+                    start=start, end=end, game_type=game_type)
     return df
 
 
@@ -324,8 +394,7 @@ def pitcher_game(pitcher: str | int, *, game_pk: int | None = None,
 
 def _title(df: pd.DataFrame) -> str:
     at = df.attrs
-    when = at.get("date") or at.get("game_date") or ", ".join(
-        str(y) for y in at.get("seasons", ()))
+    when = at.get("date") or at.get("game_date") or at.get("span", "")
     return (f"{at.get('pitcher_name') or 'MLB'} | {at.get('scope', '?')} "
             f"{when} [{at.get('game_type', 'R')}]")
 
@@ -355,15 +424,23 @@ def _build_parser():
     ap = argparse.ArgumentParser(description="Pull pitch-level Statcast data.")
     sub = ap.add_subparsers(dest="mode", required=True)
 
-    p = sub.add_parser("mlb-season", parents=[common], help="all pitches in one or more seasons")
-    p.add_argument("seasons", nargs="+", type=int)
-    p.set_defaults(run=lambda a: mlb_season(a.seasons, game_type=a.game_type,
+    p = sub.add_parser("mlb-season", parents=[common],
+                       help="all pitches in whole seasons, or between two dates")
+    p.add_argument("seasons", nargs="*", type=int)
+    p.add_argument("--start", help="YYYY-MM-DD (use instead of seasons)")
+    p.add_argument("--end", help="YYYY-MM-DD")
+    p.set_defaults(run=lambda a: mlb_season(a.seasons or None, start=a.start,
+                                            end=a.end, game_type=a.game_type,
                                             workers=a.workers))
 
-    p = sub.add_parser("pitcher-season", parents=[common], help="one pitcher, one or more seasons")
+    p = sub.add_parser("pitcher-season", parents=[common],
+                       help="one pitcher, whole seasons or between two dates")
     p.add_argument("pitcher", help='name ("Tarik Skubal") or MLBAM id (669373)')
-    p.add_argument("seasons", nargs="+", type=int)
-    p.set_defaults(run=lambda a: pitcher_season(a.pitcher, a.seasons,
+    p.add_argument("seasons", nargs="*", type=int)
+    p.add_argument("--start", help="YYYY-MM-DD (use instead of seasons)")
+    p.add_argument("--end", help="YYYY-MM-DD")
+    p.set_defaults(run=lambda a: pitcher_season(a.pitcher, a.seasons or None,
+                                                start=a.start, end=a.end,
                                                 game_type=a.game_type,
                                                 workers=a.workers))
 
