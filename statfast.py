@@ -32,45 +32,112 @@ API = "https://statsapi.mlb.com/api/v1"
 class NotFound(LookupError):
     """A requested player or game does not exist."""
 
-# Whitelist of JSON keys; roughly halves the playByPlay payload.
+# Whitelist of JSON keys. Covers every field we extract; omits only `link`
+# (a URL rebuildable from `id`), the always-empty hot/cold zone arrays, and the
+# runners/index arrays, which are one-to-many rather than per-pitch.
 _FIELDS = ",".join((
-    "allPlays", "about", "inning", "halfInning", "atBatIndex",
-    "matchup", "batter", "pitcher", "id", "batSide", "pitchHand", "code",
-    "result", "eventType",
-    "playEvents", "isPitch", "pitchNumber", "playId", "details", "call",
-    "description", "type", "eventType",
+    "allPlays",
+    # play: about
+    "about", "atBatIndex", "captivatingIndex", "endTime", "halfInning", "hasOut",
+    "hasReview", "inning", "isComplete", "isScoringPlay", "isTopInning", "startTime",
+    # play: matchup
+    "matchup", "batSide", "code", "description", "batter", "id", "fullName",
+    "pitchHand", "pitcher", "postOnFirst", "postOnSecond", "postOnThird",
+    "splits", "menOnBase",
+    # play: result + review
+    "result", "awayScore", "homeScore", "event", "eventType", "isOut", "rbi", "type",
+    "reviewDetails", "challengeTeamId", "inProgress", "isOverturned", "reviewType",
+    # pitch event
+    "playEvents", "index", "playId", "pitchNumber", "isPitch",
+    "details", "call", "disengagementNum", "isBall", "isInPlay",
+    "isStrike", "runnerGoing",
     "count", "balls", "strikes", "outs",
-    "pitchData", "startSpeed", "endSpeed", "zone", "extension",
-    "strikeZoneTop", "strikeZoneBottom", "coordinates",
-    "pX", "pZ", "pfxX", "pfxZ", "vX0", "vY0", "vZ0", "aX", "aY", "aZ",
-    "x0", "y0", "z0",
-    "breaks", "spinRate", "spinDirection", "breakVerticalInduced", "breakHorizontal",
-    "hitData", "launchSpeed", "launchAngle", "totalDistance",
+    "pitchData", "endSpeed", "extension", "plateTime", "startSpeed",
+    "strikeZoneBottom", "strikeZoneTop", "typeConfidence", "zone",
+    "breaks", "breakAngle", "breakHorizontal", "breakLength", "breakVertical",
+    "breakVerticalInduced", "breakY", "spinDirection", "spinRate",
+    "coordinates", "aX", "aY", "aZ", "pX", "pZ", "pfxX", "pfxZ",
+    "vX0", "vY0", "vZ0", "x", "x0", "y", "y0", "z0",
+    "hitData", "coordX", "coordY", "hardness", "launchAngle", "launchSpeed",
+    "location", "totalDistance", "trajectory",
 ))
 _SCHED_FIELDS = "dates,date,games,gamePk,status,codedGameState"
 # The schedule endpoint has no "P" code; postseason is wild card / division /
 # league championship / world series. The gameLog endpoint does accept "P".
 _POSTSEASON = "F,D,L,W"
 
-_COLS = ("game_pk", "game_date", "inning", "half", "at_bat_index", "pitch_number",
-         "pitch_type", "call_code", "description", "events", "balls",
-         "strikes", "outs", "pitcher", "batter", "stand", "p_throws",
-         "release_speed", "end_speed", "zone", "release_extension",
-         "plate_x", "plate_z", "pfx_x", "pfx_z", "vx0", "vy0", "vz0",
-         "ax", "ay", "az", "release_pos_x", "release_pos_y", "release_pos_z",
-         "release_spin_rate", "spin_axis", "ivb", "hb", "sz_top", "sz_bot",
-         "launch_speed", "launch_angle", "hit_distance", "play_id")
+# Play-level fields, repeated for every pitch in the plate appearance.
+_PLAY_COLS = (
+    "game_pk", "game_date",
+    "at_bat_index", "inning", "half", "is_top_inning",
+    "play_start_time", "play_end_time", "captivating_index",
+    "play_has_out", "play_is_complete", "is_scoring_play", "play_has_review",
+    "pitcher", "pitcher_name", "p_throws", "p_throws_desc",
+    "batter", "batter_name", "stand", "stand_desc",
+    "on_1b", "on_2b", "on_3b",
+    "split_batter", "split_pitcher", "men_on_base",
+    "events", "event", "event_desc", "result_type", "result_is_out", "rbi",
+    "away_score", "home_score",
+    "review_type", "review_team_id", "review_overturned", "review_in_progress",
+)
+
+# Fields carried by the individual pitch.
+_PITCH_COLS = (
+    "pitch_number", "event_index", "play_id", "pitch_start_time", "pitch_end_time",
+    "pitch_type", "pitch_name", "call_code", "call_name", "description", "det_code",
+    "is_ball", "is_strike", "is_in_play", "is_out", "pitch_has_review",
+    "runner_going", "disengagement_num",
+    "balls", "strikes", "outs",
+    "release_speed", "end_speed", "plate_time", "release_extension",
+    "type_confidence", "zone", "sz_top", "sz_bot",
+    "plate_x", "plate_z", "pfx_x", "pfx_z",
+    "vx0", "vy0", "vz0", "ax", "ay", "az",
+    "release_pos_x", "release_pos_y", "release_pos_z",
+    "pitch_coord_x", "pitch_coord_y",
+    "break_angle", "break_length", "break_y", "break_vertical", "ivb", "hb",
+    "release_spin_rate", "spin_axis",
+    "launch_speed", "launch_angle", "hit_distance", "trajectory", "hardness",
+    "hit_location", "hit_coord_x", "hit_coord_y",
+)
+
+_COLS = _PLAY_COLS + _PITCH_COLS
+#: Every column a pull can return, in default order. Pass any subset as
+#: ``columns=`` to the pull functions.
+COLUMNS = _COLS
+# Needed to order the result; materialised even when not requested.
+_SORT = ("game_date", "game_pk", "at_bat_index", "pitch_number")
 
 # float32 is ample: Statcast reports 1-2 decimals.
-_F32 = ("release_speed", "end_speed", "release_extension", "plate_x", "plate_z",
-        "pfx_x", "pfx_z", "vx0", "vy0", "vz0",
-        "ax", "ay", "az", "release_pos_x", "release_pos_y", "release_pos_z",
-        "ivb", "hb", "sz_top", "sz_bot", "launch_speed", "launch_angle",
-        "hit_distance", "release_spin_rate", "spin_axis")
-_U8 = ("balls", "strikes", "outs", "inning", "pitch_number", "zone")
+_F32 = ("release_speed", "end_speed", "plate_time", "release_extension",
+        "type_confidence", "sz_top", "sz_bot",
+        "plate_x", "plate_z", "pfx_x", "pfx_z",
+        "vx0", "vy0", "vz0", "ax", "ay", "az",
+        "release_pos_x", "release_pos_y", "release_pos_z",
+        "pitch_coord_x", "pitch_coord_y",
+        "break_angle", "break_length", "break_y", "break_vertical", "ivb", "hb",
+        "release_spin_rate", "spin_axis",
+        "launch_speed", "launch_angle", "hit_distance",
+        "hit_coord_x", "hit_coord_y")
+# UInt8 is nullable, so it covers the sparse small ints too.
+_U8 = ("balls", "strikes", "outs", "inning", "pitch_number", "zone",
+       "event_index", "captivating_index", "rbi", "away_score", "home_score",
+       "disengagement_num")
 _I32 = ("game_pk", "pitcher", "batter", "at_bat_index")
-_CAT = ("pitch_type", "description", "call_code", "events", "stand", "p_throws", "half")
-_CASTS = ((_F32, "float32"), (_U8, "UInt8"), (_I32, "int32"), (_CAT, "category"))
+_I32N = ("on_1b", "on_2b", "on_3b", "review_team_id")
+_BOOL = ("is_top_inning", "play_has_out", "play_is_complete", "is_scoring_play",
+         "play_has_review", "result_is_out", "is_ball", "is_strike", "is_in_play",
+         "is_out", "pitch_has_review", "runner_going", "review_overturned",
+         "review_in_progress")
+_CAT = ("pitch_type", "pitch_name", "call_code", "call_name", "description",
+        "det_code", "events", "event", "event_desc", "result_type",
+        "stand", "stand_desc", "p_throws", "p_throws_desc", "half",
+        "pitcher_name", "batter_name", "split_batter", "split_pitcher",
+        "men_on_base", "trajectory", "hardness", "hit_location", "review_type")
+_TIME = ("play_start_time", "play_end_time", "pitch_start_time", "pitch_end_time")
+
+_NUMERIC = ("float32", "UInt8", "int32", "Int32")
+_CASTS = ((_F32, "float32"), (_U8, "UInt8"), (_I32, "int32"), (_I32N, "Int32"),
+          (_BOOL, "boolean"), (_CAT, "category"))
 
 
 def _session(pool: int = 16) -> requests.Session:
@@ -194,15 +261,40 @@ def _pitcher_games(s: requests.Session, pitcher_id: int, season: int,
 # fetch + flatten
 # ---------------------------------------------------------------------------
 
-def _play_rows(play: dict, pk: int, date: str, pid: int | None) -> Iterator[tuple]:
-    """Yield one row per tracked pitch in a single plate appearance."""
+def _play_head(play: dict, pk: int, date: str, pid: int | None) -> tuple:
+    """Play-level values, identical for every pitch in the plate appearance."""
     mu = play.get("matchup", {})
     ab = play.get("about", {})
-    inn, half, abi = ab.get("inning"), ab.get("halfInning"), ab.get("atBatIndex")
-    bat = mu.get("batter", {}).get("id")
-    stand = mu.get("batSide", {}).get("code")
-    throws = mu.get("pitchHand", {}).get("code")
-    ev = play.get("result", {}).get("eventType")
+    res = play.get("result", {})
+    rev = play.get("reviewDetails", {})
+    spl = mu.get("splits", {})
+    return (
+        pk, date,
+        ab.get("atBatIndex"), ab.get("inning"), ab.get("halfInning"),
+        ab.get("isTopInning"), ab.get("startTime"), ab.get("endTime"),
+        ab.get("captivatingIndex"), ab.get("hasOut"), ab.get("isComplete"),
+        ab.get("isScoringPlay"), ab.get("hasReview"),
+        pid, (mu.get("pitcher") or {}).get("fullName"),
+        (mu.get("pitchHand") or {}).get("code"),
+        (mu.get("pitchHand") or {}).get("description"),
+        (mu.get("batter") or {}).get("id"), (mu.get("batter") or {}).get("fullName"),
+        (mu.get("batSide") or {}).get("code"),
+        (mu.get("batSide") or {}).get("description"),
+        (mu.get("postOnFirst") or {}).get("id"),
+        (mu.get("postOnSecond") or {}).get("id"),
+        (mu.get("postOnThird") or {}).get("id"),
+        spl.get("batter"), spl.get("pitcher"), spl.get("menOnBase"),
+        res.get("eventType"), res.get("event"), res.get("description"),
+        res.get("type"), res.get("isOut"), res.get("rbi"),
+        res.get("awayScore"), res.get("homeScore"),
+        rev.get("reviewType"), rev.get("challengeTeamId"),
+        rev.get("isOverturned"), rev.get("inProgress"),
+    )
+
+
+def _play_rows(play: dict, pk: int, date: str, pid: int | None) -> Iterator[tuple]:
+    """Yield one row per tracked pitch in a single plate appearance."""
+    head = _play_head(play, pk, date, pid)
     for e in play.get("playEvents", ()):
         pit = e.get("pitchData")
         if not pit:                      # skips IBB / timer-violation phantoms
@@ -210,24 +302,36 @@ def _play_rows(play: dict, pk: int, date: str, pid: int | None) -> Iterator[tupl
         co = pit.get("coordinates", {})
         br = pit.get("breaks", {})
         hd = e.get("hitData", {})
+        hc = hd.get("coordinates", {})
         det = e.get("details", {})
         cnt = e.get("count", {})
-        yield (pk, date, inn, half, abi, e.get("pitchNumber"),
-               det.get("type", {}).get("code"), det.get("call", {}).get("code"),
-               det.get("description"), ev,
-               cnt.get("balls"), cnt.get("strikes"), cnt.get("outs"),
-               pid, bat, stand, throws,
-               pit.get("startSpeed"), pit.get("endSpeed"), pit.get("zone"),
-               pit.get("extension"),
-               co.get("pX"), co.get("pZ"), co.get("pfxX"), co.get("pfxZ"),
-               co.get("vX0"), co.get("vY0"), co.get("vZ0"),
-               co.get("aX"), co.get("aY"), co.get("aZ"),
-               co.get("x0"), co.get("y0"), co.get("z0"),
-               br.get("spinRate"), br.get("spinDirection"),
-               br.get("breakVerticalInduced"), br.get("breakHorizontal"),
-               pit.get("strikeZoneTop"), pit.get("strikeZoneBottom"),
-               hd.get("launchSpeed"), hd.get("launchAngle"), hd.get("totalDistance"),
-               e.get("playId"))
+        typ = det.get("type", {})
+        call = det.get("call", {})
+        yield head + (
+            e.get("pitchNumber"), e.get("index"), e.get("playId"),
+            e.get("startTime"), e.get("endTime"),
+            typ.get("code"), typ.get("description"),
+            call.get("code"), call.get("description"),
+            det.get("description"), det.get("code"),
+            det.get("isBall"), det.get("isStrike"), det.get("isInPlay"),
+            det.get("isOut"), det.get("hasReview"), det.get("runnerGoing"),
+            det.get("disengagementNum"),
+            cnt.get("balls"), cnt.get("strikes"), cnt.get("outs"),
+            pit.get("startSpeed"), pit.get("endSpeed"), pit.get("plateTime"),
+            pit.get("extension"), pit.get("typeConfidence"), pit.get("zone"),
+            pit.get("strikeZoneTop"), pit.get("strikeZoneBottom"),
+            co.get("pX"), co.get("pZ"), co.get("pfxX"), co.get("pfxZ"),
+            co.get("vX0"), co.get("vY0"), co.get("vZ0"),
+            co.get("aX"), co.get("aY"), co.get("aZ"),
+            co.get("x0"), co.get("y0"), co.get("z0"),
+            co.get("x"), co.get("y"),
+            br.get("breakAngle"), br.get("breakLength"), br.get("breakY"),
+            br.get("breakVertical"), br.get("breakVerticalInduced"),
+            br.get("breakHorizontal"), br.get("spinRate"), br.get("spinDirection"),
+            hd.get("launchSpeed"), hd.get("launchAngle"), hd.get("totalDistance"),
+            hd.get("trajectory"), hd.get("hardness"), hd.get("location"),
+            hc.get("coordX"), hc.get("coordY"),
+        )
 
 
 def _game_rows(blob: bytes, pk: int, date: str,
@@ -239,22 +343,56 @@ def _game_rows(blob: bytes, pk: int, date: str,
             yield from _play_rows(play, pk, date, pid)
 
 
+def _check_columns(columns) -> None:
+    """Reject unknown column names up front."""
+    if columns is None:
+        return
+    unknown = [c for c in columns if c not in _COLS]
+    if unknown:
+        raise ValueError(f"unknown column(s): {', '.join(unknown)}. "
+                         f"See statfast.COLUMNS for the {len(_COLS)} valid names.")
+
+
+def _work_columns(columns) -> list[str]:
+    """Columns to materialise: those requested, plus the sort keys."""
+    if columns is None:
+        return list(_COLS)
+    wanted = set(columns) | set(_SORT)
+    return [c for c in _COLS if c in wanted]
+
+
+def _select(df: pd.DataFrame, columns) -> pd.DataFrame:
+    """Narrow to the requested columns, in the caller's order."""
+    return df if columns is None else df[list(columns)]
+
+
+def _cast_group(df: pd.DataFrame, cols: tuple[str, ...], dtype: str) -> None:
+    numeric = dtype in _NUMERIC
+    for c in cols:
+        if c not in df.columns:
+            continue
+        col = pd.to_numeric(df[c], errors="coerce") if numeric else df[c]
+        df[c] = col.astype(dtype)
+
+
 def _cast(df: pd.DataFrame) -> pd.DataFrame:
-    """Shrink to compact dtypes in place."""
-    df["game_date"] = pd.to_datetime(df["game_date"], format="%Y-%m-%d")
+    """Shrink to compact dtypes in place, skipping columns not present."""
+    if "game_date" in df.columns:
+        df["game_date"] = pd.to_datetime(df["game_date"], format="%Y-%m-%d")
+    for c in _TIME:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], format="ISO8601", utc=True)
     for cols, dtype in _CASTS:
-        numeric = dtype != "category"
-        for c in cols:
-            col = pd.to_numeric(df[c], errors="coerce") if numeric else df[c]
-            df[c] = col.astype(dtype)
+        _cast_group(df, cols, dtype)
     return df
 
 
 def _collect(s: requests.Session, games: dict[int, str], pitcher_id: int | None,
-             workers: int) -> pd.DataFrame:
+             workers: int, columns=None) -> pd.DataFrame:
     """Fetch each game's playByPlay in parallel and flatten to a DataFrame."""
+    _check_columns(columns)
     if not games:
-        return pd.DataFrame(columns=_COLS)
+        return _select(pd.DataFrame(columns=_COLS), columns)
 
     def fetch(pk: int) -> bytes:
         r = s.get(f"{API}/game/{pk}/playByPlay", params={"fields": _FIELDS}, timeout=30)
@@ -269,9 +407,9 @@ def _collect(s: requests.Session, games: dict[int, str], pitcher_id: int | None,
             for row in _game_rows(blob, pk, games[pk], pitcher_id)]
     df = pd.DataFrame(rows, columns=_COLS)
     if df.empty:
-        return df
-    return _cast(df).sort_values(["game_date", "game_pk", "at_bat_index", "pitch_number"],
-                                 ignore_index=True)
+        return _select(df, columns)
+    df = _cast(df[_work_columns(columns)]).sort_values(list(_SORT), ignore_index=True)
+    return _select(df, columns)
 
 
 # ---------------------------------------------------------------------------
@@ -317,12 +455,13 @@ def resolve_pitcher(name: str | int, season: int | None = None,
 def mlb_season(seasons: int | Iterable[int] | None = None, *,
                start: str | None = None, end: str | None = None,
                game_type: str = "R", workers: int = 12,
+               columns: Iterable[str] | None = None,
                session: requests.Session | None = None) -> pd.DataFrame:
     """Every tracked pitch in whole seasons, or between two dates."""
     _check_span(seasons, start, end)
     s = session or _session(workers)
     games = _mlb_games(s, seasons, start, end, game_type)
-    df = _collect(s, games, None, workers)
+    df = _collect(s, games, None, workers, columns)
     df.attrs.update(scope="mlb_season", span=_span_label(seasons, start, end),
                     start=start, end=end, game_type=game_type)
     return df
@@ -332,13 +471,14 @@ def pitcher_season(pitcher: str | int,
                    seasons: int | Iterable[int] | None = None, *,
                    start: str | None = None, end: str | None = None,
                    game_type: str = "R", workers: int = 12,
+                   columns: Iterable[str] | None = None,
                    session: requests.Session | None = None) -> pd.DataFrame:
     """Every tracked pitch by one pitcher, in whole seasons or between dates."""
     _check_span(seasons, start, end)
     s = session or _session(workers)
     pid, full = resolve_pitcher(pitcher, session=s)
     games = _pitcher_span_games(s, pid, seasons, start, end, game_type)
-    df = _collect(s, games, pid, workers)
+    df = _collect(s, games, pid, workers, columns)
     df.attrs.update(scope="pitcher_season", pitcher_id=pid, pitcher_name=full,
                     span=_span_label(seasons, start, end),
                     start=start, end=end, game_type=game_type)
@@ -346,11 +486,12 @@ def pitcher_season(pitcher: str | int,
 
 
 def mlb_day(date: str, *, game_type: str = "R", workers: int = 12,
+            columns: Iterable[str] | None = None,
             session: requests.Session | None = None) -> pd.DataFrame:
     """Every tracked pitch thrown on a single date (YYYY-MM-DD)."""
     s = session or _session(workers)
     games = _schedule(s, {"date": str(date), "gameType": game_type})
-    df = _collect(s, games, None, workers)
+    df = _collect(s, games, None, workers, columns)
     df.attrs.update(scope="mlb_day", date=str(date), game_type=game_type)
     return df
 
@@ -373,7 +514,7 @@ def _one_game(s: requests.Session, pid: int, game_pk: int | None,
 
 def pitcher_game(pitcher: str | int, *, game_pk: int | None = None,
                  game_date: str | None = None, game_type: str = "R",
-                 workers: int = 12,
+                 workers: int = 12, columns: Iterable[str] | None = None,
                  session: requests.Session | None = None) -> pd.DataFrame:
     """Every tracked pitch by one pitcher in a single game (by gamePk or date)."""
     if (game_pk is None) == (game_date is None):
@@ -381,7 +522,7 @@ def pitcher_game(pitcher: str | int, *, game_pk: int | None = None,
     s = session or _session(workers)
     pid, full = resolve_pitcher(pitcher, session=s)
     games = _one_game(s, pid, game_pk, game_date, game_type)
-    df = _collect(s, games, pid, workers)
+    df = _collect(s, games, pid, workers, columns)
     first = next(iter(games))
     df.attrs.update(scope="pitcher_game", pitcher_id=pid, pitcher_name=full,
                     game_pk=first, game_date=games[first], game_type=game_type)
@@ -399,17 +540,33 @@ def _title(df: pd.DataFrame) -> str:
             f"{when} [{at.get('game_type', 'R')}]")
 
 
-def _report(df: pd.DataFrame, elapsed: float) -> None:
-    mb = df.memory_usage(deep=True).sum() / 1e6
-    print(_title(df))
-    print(f"  {len(df):,} pitches / {df.game_pk.nunique():,} games / {df.shape[1]} cols")
-    print(f"  {df.game_date.min().date()} -> {df.game_date.max().date()}")
-    print(f"  {elapsed:.2f}s, {mb:,.1f} MB")
-    if df.pitcher.nunique() > 1:
-        print(f"  {df.pitcher.nunique():,} pitchers, {df.batter.nunique():,} batters")
+def _report_span(df: pd.DataFrame) -> None:
+    if "game_pk" in df:
+        print(f"  {df.game_pk.nunique():,} games")
+    if "game_date" in df:
+        print(f"  {df.game_date.min().date()} -> {df.game_date.max().date()}")
+    if "pitcher" in df and df.pitcher.nunique() > 1:
+        print(f"  {df.pitcher.nunique():,} pitchers")
+
+
+def _report_mix(df: pd.DataFrame) -> None:
+    if "pitch_type" not in df or "release_speed" not in df:
+        return
     mix = df.pitch_type.value_counts(normalize=True).mul(100).head(6)
     velo = df.groupby("pitch_type", observed=True).release_speed.mean()
     print("  mix:", ", ".join(f"{p} {mix[p]:.1f}% @{velo[p]:.1f}" for p in mix.index))
+
+
+def _report(df: pd.DataFrame, elapsed: float) -> None:
+    mb = df.memory_usage(deep=True).sum() / 1e6
+    print(_title(df))
+    print(f"  {len(df):,} pitches / {df.shape[1]} cols / {elapsed:.2f}s / {mb:,.1f} MB")
+    _report_span(df)
+    _report_mix(df)
+
+
+def _split_columns(value: str | None) -> list[str] | None:
+    return [c.strip() for c in value.split(",")] if value else None
 
 
 def _build_parser():
@@ -420,6 +577,8 @@ def _build_parser():
                         help='"R" (default), "P", "S", or e.g. "R,P"')
     common.add_argument("-w", "--workers", type=int, default=12)
     common.add_argument("-o", "--out", help="write .parquet / .csv")
+    common.add_argument("-c", "--columns",
+                        help="comma-separated subset of columns (default: all)")
 
     ap = argparse.ArgumentParser(description="Pull pitch-level Statcast data.")
     sub = ap.add_subparsers(dest="mode", required=True)
@@ -431,7 +590,8 @@ def _build_parser():
     p.add_argument("--end", help="YYYY-MM-DD")
     p.set_defaults(run=lambda a: mlb_season(a.seasons or None, start=a.start,
                                             end=a.end, game_type=a.game_type,
-                                            workers=a.workers))
+                                            workers=a.workers,
+                                            columns=_split_columns(a.columns)))
 
     p = sub.add_parser("pitcher-season", parents=[common],
                        help="one pitcher, whole seasons or between two dates")
@@ -442,7 +602,8 @@ def _build_parser():
     p.set_defaults(run=lambda a: pitcher_season(a.pitcher, a.seasons or None,
                                                 start=a.start, end=a.end,
                                                 game_type=a.game_type,
-                                                workers=a.workers))
+                                                workers=a.workers,
+                                                columns=_split_columns(a.columns)))
 
     p = sub.add_parser("pitcher-game", parents=[common], help="one pitcher, one game")
     p.add_argument("pitcher", help='name ("Tarik Skubal") or MLBAM id (669373)')
@@ -452,12 +613,14 @@ def _build_parser():
     p.set_defaults(run=lambda a: pitcher_game(a.pitcher, game_pk=a.pk,
                                               game_date=a.date,
                                               game_type=a.game_type,
-                                              workers=a.workers))
+                                              workers=a.workers,
+                                              columns=_split_columns(a.columns)))
 
     p = sub.add_parser("mlb-day", parents=[common], help="all pitches on one date")
     p.add_argument("date", help="YYYY-MM-DD")
     p.set_defaults(run=lambda a: mlb_day(a.date, game_type=a.game_type,
-                                         workers=a.workers))
+                                         workers=a.workers,
+                                         columns=_split_columns(a.columns)))
     return ap
 
 
