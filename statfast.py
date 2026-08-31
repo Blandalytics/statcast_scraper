@@ -361,6 +361,19 @@ def _work_columns(columns) -> list[str]:
     return [c for c in _COLS if c in wanted]
 
 
+def _narrow(df: pd.DataFrame, columns) -> pd.DataFrame:
+    """Frame limited to the working columns, owning its data.
+
+    ``_cast`` assigns into its argument. A bare ``df[cols]`` slice is a child of
+    ``df``, so mutating it raises SettingWithCopyWarning on pandas < 3; the
+    explicit copy detaches it. The default path needs no copy because the frame
+    was just built from the row tuples and has no parent.
+    """
+    if columns is None:
+        return df
+    return df[_work_columns(columns)].copy()
+
+
 def _select(df: pd.DataFrame, columns) -> pd.DataFrame:
     """Narrow to the requested columns, in the caller's order."""
     return df if columns is None else df[list(columns)]
@@ -408,7 +421,7 @@ def _collect(s: requests.Session, games: dict[int, str], pitcher_id: int | None,
     df = pd.DataFrame(rows, columns=_COLS)
     if df.empty:
         return _select(df, columns)
-    df = _cast(df[_work_columns(columns)]).sort_values(list(_SORT), ignore_index=True)
+    df = _cast(_narrow(df, columns)).sort_values(list(_SORT), ignore_index=True)
     return _select(df, columns)
 
 
