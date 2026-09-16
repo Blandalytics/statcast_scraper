@@ -20,10 +20,12 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator
 from typing import NamedTuple
 from concurrent.futures import ThreadPoolExecutor
+from itertools import batched
 
 import orjson
 import pandas as pd
 import requests
+from pandas.api.types import union_categoricals
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -148,8 +150,13 @@ _CAT = ("home_team", "away_team", "bat_team", "field_team",
 _TIME = ("play_start_time", "play_end_time", "pitch_start_time", "pitch_end_time")
 
 _NUMERIC = ("float32", "UInt8", "int32", "Int32")
-_CASTS = ((_F32, "float32"), (_U8, "UInt8"), (_I32, "int32"), (_I32N, "Int32"),
-          (_BOOL, "boolean"), (_CAT, "category"))
+# Applied per chunk while streaming. Category is handled separately by
+# _categorize, since it needs a uniform intermediate dtype (see there).
+_VALUE_CASTS = ((_F32, "float32"), (_U8, "UInt8"), (_I32, "int32"), (_I32N, "Int32"),
+                (_BOOL, "boolean"))
+# Games flattened per chunk. Bounds the transient Python-object cost of the
+# row tuples; ~100 games is ~30k pitches.
+_CHUNK_GAMES = 100
 
 
 def _session(pool: int = 16) -> requests.Session:
@@ -456,16 +463,77 @@ def _cast_group(df: pd.DataFrame, cols: tuple[str, ...], dtype: str) -> None:
         df[c] = col.astype(dtype)
 
 
-def _cast(df: pd.DataFrame) -> pd.DataFrame:
-    """Shrink to compact dtypes in place, skipping columns not present."""
+def _cast_values(df: pd.DataFrame) -> pd.DataFrame:
+    """Compact every non-string column in place, skipping columns not present."""
     if "game_date" in df.columns:
         df["game_date"] = pd.to_datetime(df["game_date"], format="%Y-%m-%d")
     for c in _TIME:
         if c in df.columns:
             df[c] = pd.to_datetime(df[c], format="ISO8601", utc=True)
-    for cols, dtype in _CASTS:
+    for cols, dtype in _VALUE_CASTS:
         _cast_group(df, cols, dtype)
     return df
+
+
+def _categorize(df: pd.DataFrame) -> pd.DataFrame:
+    """Dictionary-encode the string columns in place.
+
+    The intermediate NA-preserving "string" cast gives every chunk the same
+    category dtype. Without it, a chunk where a column is entirely null (say
+    ``review_type`` in games with no challenges) yields object-dtype categories
+    that ``union_categoricals`` refuses to merge with the others.
+    """
+    for c in _CAT:
+        if c in df.columns:
+            df[c] = df[c].astype("string").astype("category")
+    return df
+
+
+def _concat(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """Concatenate chunk frames, keeping categoricals categorical.
+
+    ``pd.concat`` degrades categoricals with differing category sets to
+    object, so the string columns are unioned explicitly instead.
+    """
+    cats = [c for c in _CAT if c in frames[0].columns]
+    df = pd.concat([f.drop(columns=cats) for f in frames], ignore_index=True)
+    for c in cats:
+        df[c] = union_categoricals([f[c] for f in frames])
+    return df[list(frames[0].columns)]        # restore column order
+
+
+def _fetch_all(s: requests.Session, games: dict[int, _Game],
+               workers: int) -> Iterator[tuple[int, bytes]]:
+    """Yield (gamePk, playByPlay bytes) as downloads complete, in game order.
+
+    Consumed lazily: ``Executor.map`` drops each future once yielded, and
+    flattening is faster than the network, so at most a handful of blobs are
+    ever resident. Materialising the whole list held ~1 GB for a season.
+    """
+    def fetch(pk: int) -> bytes:
+        r = s.get(f"{API}/game/{pk}/playByPlay", params={"fields": _FIELDS}, timeout=30)
+        r.raise_for_status()
+        return r.content
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        yield from zip(games, ex.map(fetch, games), strict=True)
+
+
+def _chunk_frames(s: requests.Session, games: dict[int, _Game],
+                  teams: dict[int, tuple[str, str]], pitcher_id: int | None,
+                  workers: int, columns) -> Iterator[pd.DataFrame]:
+    """Flatten games in chunks, yielding a value-compacted frame per chunk.
+
+    The row tuples for one chunk are the only Python-object-heavy state alive
+    at a time; each chunk's frame is fully compact before the next chunk starts.
+    """
+    for batch in batched(_fetch_all(s, games, workers), _CHUNK_GAMES):
+        rows = [row
+                for pk, blob in batch
+                for row in _game_rows(blob, pk, games[pk], teams[pk], pitcher_id)]
+        if rows:
+            df = _cast_values(_narrow(pd.DataFrame(rows, columns=_COLS), columns))
+            yield _categorize(df)
 
 
 def _collect(s: requests.Session, games: dict[int, _Game], pitcher_id: int | None,
@@ -474,23 +542,13 @@ def _collect(s: requests.Session, games: dict[int, _Game], pitcher_id: int | Non
     _check_columns(columns)
     if not games:
         return _select(pd.DataFrame(columns=_COLS), columns)
-
-    def fetch(pk: int) -> bytes:
-        r = s.get(f"{API}/game/{pk}/playByPlay", params={"fields": _FIELDS}, timeout=30)
-        r.raise_for_status()
-        return r.content
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        blobs = list(zip(games, ex.map(fetch, games), strict=True))
-
     teams = _team_names(s, games)
-    rows = [row
-            for pk, blob in blobs
-            for row in _game_rows(blob, pk, games[pk], teams[pk], pitcher_id)]
-    df = pd.DataFrame(rows, columns=_COLS)
-    if df.empty:
-        return _select(df, columns)
-    df = _cast(_narrow(df, columns)).sort_values(list(_SORT), ignore_index=True)
+    frames = list(_chunk_frames(s, games, teams, pitcher_id, workers, columns))
+    if not frames:
+        return _select(pd.DataFrame(columns=_COLS), columns)
+    df = _concat(frames)
+    del frames                                   # drop the chunk copies early
+    df = df.sort_values(list(_SORT), ignore_index=True)
     return _select(df, columns)
 
 
