@@ -18,6 +18,7 @@ lighter than the Baseball Savant CSV export.
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
+from typing import NamedTuple
 from concurrent.futures import ThreadPoolExecutor
 
 import orjson
@@ -61,7 +62,14 @@ _FIELDS = ",".join((
     "hitData", "coordX", "coordY", "hardness", "launchAngle", "launchSpeed",
     "location", "totalDistance", "trajectory",
 ))
-_SCHED_FIELDS = "dates,date,games,gamePk,status,codedGameState"
+_SCHED_FIELDS = "dates,date,games,gamePk,status,codedGameState,teams,home,away,team,id"
+
+
+class _Game(NamedTuple):
+    """What discovery knows about a game before its play-by-play is fetched."""
+    date: str
+    home: int   # team id
+    away: int   # team id
 # The schedule endpoint has no "P" code; postseason is wild card / division /
 # league championship / world series. The gameLog endpoint does accept "P".
 _POSTSEASON = "F,D,L,W"
@@ -69,6 +77,7 @@ _POSTSEASON = "F,D,L,W"
 # Play-level fields, repeated for every pitch in the plate appearance.
 _PLAY_COLS = (
     "game_pk", "game_date",
+    "home_team", "away_team", "bat_team", "field_team",
     "at_bat_index", "inning", "half", "is_top_inning",
     "play_start_time", "play_end_time", "captivating_index",
     "play_has_out", "play_is_complete", "is_scoring_play", "play_has_review",
@@ -77,7 +86,8 @@ _PLAY_COLS = (
     "on_1b", "on_2b", "on_3b",
     "split_batter", "split_pitcher", "men_on_base",
     "events", "event", "event_desc", "result_type", "result_is_out", "rbi",
-    "away_score", "home_score",
+    "away_score", "home_score", "bat_score", "field_score",
+    "post_away_score", "post_home_score", "post_bat_score", "post_field_score",
     "review_type", "review_team_id", "review_overturned", "review_in_progress",
 )
 
@@ -120,15 +130,17 @@ _F32 = ("release_speed", "end_speed", "plate_time", "release_extension",
         "hit_coord_x", "hit_coord_y")
 # UInt8 is nullable, so it covers the sparse small ints too.
 _U8 = ("balls", "strikes", "outs", "inning", "pitch_number", "zone",
-       "event_index", "captivating_index", "rbi", "away_score", "home_score",
-       "disengagement_num")
+       "event_index", "captivating_index", "rbi", "disengagement_num",
+       "away_score", "home_score", "bat_score", "field_score",
+       "post_away_score", "post_home_score", "post_bat_score", "post_field_score")
 _I32 = ("game_pk", "pitcher", "batter", "at_bat_index")
 _I32N = ("on_1b", "on_2b", "on_3b", "review_team_id")
 _BOOL = ("is_top_inning", "play_has_out", "play_is_complete", "is_scoring_play",
          "play_has_review", "result_is_out", "is_ball", "is_strike", "is_in_play",
          "is_out", "pitch_has_review", "runner_going", "review_overturned",
          "review_in_progress")
-_CAT = ("pitch_type", "pitch_name", "call_code", "call_name", "description",
+_CAT = ("home_team", "away_team", "bat_team", "field_team",
+        "pitch_type", "pitch_name", "call_code", "call_name", "description",
         "det_code", "events", "event", "event_desc", "result_type",
         "stand", "stand_desc", "p_throws", "p_throws_desc", "half",
         "pitcher_name", "batter_name", "split_batter", "split_pitcher",
@@ -172,12 +184,12 @@ def _year_chunks(start: str, end: str) -> tuple[tuple[str, str], ...]:
                  for y in _years(start, end))
 
 
-def _in_range(games: dict[int, str], start: str | None,
-              end: str | None) -> dict[int, str]:
-    """Trim a gamePk -> date map to an inclusive date range."""
+def _in_range(games: dict[int, _Game], start: str | None,
+              end: str | None) -> dict[int, _Game]:
+    """Trim a game map to an inclusive date range."""
     if start is None:
         return games
-    return {pk: d for pk, d in games.items() if str(start) <= d <= str(end)}
+    return {pk: g for pk, g in games.items() if str(start) <= g.date <= str(end)}
 
 
 def _check_span(seasons, start, end) -> None:
@@ -204,8 +216,8 @@ def _sched_game_type(game_type: str) -> str:
                     for part in str(game_type).split(","))
 
 
-def _schedule(s: requests.Session, params: dict) -> dict[int, str]:
-    """Map gamePk -> date for a schedule query, keeping only games actually played.
+def _schedule(s: requests.Session, params: dict) -> dict[int, _Game]:
+    """Map gamePk -> _Game for a schedule query, keeping only games actually played.
 
     codedGameState "F" is the real filter: abstractGameState reports "Final"
     for postponed and cancelled games too.
@@ -214,7 +226,9 @@ def _schedule(s: requests.Session, params: dict) -> dict[int, str]:
     if "gameType" in q:
         q["gameType"] = _sched_game_type(q["gameType"])
     dates = s.get(f"{API}/schedule", params=q, timeout=60).json().get("dates", [])
-    return {g["gamePk"]: d["date"]
+    return {g["gamePk"]: _Game(d["date"],
+                               g["teams"]["home"]["team"]["id"],
+                               g["teams"]["away"]["team"]["id"])
             for d in dates for g in d["games"]
             if g.get("status", {}).get("codedGameState") == "F"}
 
@@ -228,50 +242,93 @@ def _mlb_queries(seasons, start, end, game_type: str) -> list[dict]:
 
 
 def _mlb_games(s: requests.Session, seasons, start, end,
-               game_type: str) -> dict[int, str]:
+               game_type: str) -> dict[int, _Game]:
     """Every played game in the requested span."""
-    games: dict[int, str] = {}
+    games: dict[int, _Game] = {}
     for q in _mlb_queries(seasons, start, end, game_type):
         games |= _schedule(s, q)
     return _in_range(games, start, end)
 
 
 def _pitcher_span_games(s: requests.Session, pid: int, seasons, start, end,
-                        game_type: str) -> dict[int, str]:
+                        game_type: str) -> dict[int, _Game]:
     """Every game the pitcher appeared in across the requested span."""
     years = _seasons(seasons) if seasons is not None else _years(start, end)
-    games: dict[int, str] = {}
+    games: dict[int, _Game] = {}
     for year in years:
         games |= _pitcher_games(s, pid, year, game_type)
     return _in_range(games, start, end)
 
 
+def _split_game(sp: dict) -> _Game:
+    """Build a _Game from a gameLog split; `team` is the pitcher's own club."""
+    own, opp = sp["team"]["id"], sp["opponent"]["id"]
+    home, away = (own, opp) if sp.get("isHome") else (opp, own)
+    return _Game(sp["date"], home, away)
+
+
 def _pitcher_games(s: requests.Session, pitcher_id: int, season: int,
-                   game_type: str) -> dict[int, str]:
-    """Map gamePk -> date for every game a pitcher appeared in."""
+                   game_type: str) -> dict[int, _Game]:
+    """Map gamePk -> _Game for every game a pitcher appeared in."""
     log = s.get(f"{API}/people/{pitcher_id}/stats",
                 params={"stats": "gameLog", "group": "pitching",
                         "season": season, "gameType": game_type},
                 timeout=30).json()
     splits = log["stats"][0]["splits"] if log.get("stats") else []
-    return {sp["game"]["gamePk"]: sp["date"] for sp in splits}
+    return {sp["game"]["gamePk"]: _split_game(sp) for sp in splits}
+
+
+def _team_abbrs(s: requests.Session, years: Iterable[str]) -> dict[tuple[str, int], str]:
+    """(season, team id) -> abbreviation. Season-keyed because clubs rebrand
+    (Oakland was OAK in 2024 and ATH in 2025 under the same id)."""
+    out: dict[tuple[str, int], str] = {}
+    for y in years:
+        r = s.get(f"{API}/teams", params={"sportId": 1, "season": y,
+                                          "fields": "teams,id,abbreviation"},
+                  timeout=30).json()
+        out.update({(str(y), t["id"]): t["abbreviation"] for t in r.get("teams", ())})
+    return out
+
+
+def _team_names(s: requests.Session,
+                games: dict[int, _Game]) -> dict[int, tuple[str, str]]:
+    """gamePk -> (home abbreviation, away abbreviation)."""
+    abbr = _team_abbrs(s, {g.date[:4] for g in games.values()})
+    return {pk: (abbr.get((g.date[:4], g.home), str(g.home)),
+                 abbr.get((g.date[:4], g.away), str(g.away)))
+            for pk, g in games.items()}
+
+
+def _sides(top: bool, away, home) -> tuple:
+    """Order an (away, home) pair as (batting, fielding)."""
+    return (away, home) if top else (home, away)
 
 
 # ---------------------------------------------------------------------------
 # fetch + flatten
 # ---------------------------------------------------------------------------
 
-def _play_head(play: dict, pk: int, date: str, pid: int | None) -> tuple:
-    """Play-level values, identical for every pitch in the plate appearance."""
+def _play_head(play: dict, pk: int, game: _Game, teams: tuple[str, str],
+               pid: int | None, pre: tuple, post: tuple) -> tuple:
+    """Play-level values, identical for every pitch in the plate appearance.
+
+    ``pre``/``post`` are (away, home) scores before and after the play.
+    """
     mu = play.get("matchup", {})
     ab = play.get("about", {})
     res = play.get("result", {})
     rev = play.get("reviewDetails", {})
     spl = mu.get("splits", {})
+    top = ab.get("isTopInning", ab.get("halfInning") == "top")
+    home, away = teams
+    bat_team, field_team = _sides(top, away, home)
+    bat_score, field_score = _sides(top, *pre)
+    post_bat, post_field = _sides(top, *post)
     return (
-        pk, date,
+        pk, game.date,
+        home, away, bat_team, field_team,
         ab.get("atBatIndex"), ab.get("inning"), ab.get("halfInning"),
-        ab.get("isTopInning"), ab.get("startTime"), ab.get("endTime"),
+        top, ab.get("startTime"), ab.get("endTime"),
         ab.get("captivatingIndex"), ab.get("hasOut"), ab.get("isComplete"),
         ab.get("isScoringPlay"), ab.get("hasReview"),
         pid, (mu.get("pitcher") or {}).get("fullName"),
@@ -286,15 +343,17 @@ def _play_head(play: dict, pk: int, date: str, pid: int | None) -> tuple:
         spl.get("batter"), spl.get("pitcher"), spl.get("menOnBase"),
         res.get("eventType"), res.get("event"), res.get("description"),
         res.get("type"), res.get("isOut"), res.get("rbi"),
-        res.get("awayScore"), res.get("homeScore"),
+        pre[0], pre[1], bat_score, field_score,
+        post[0], post[1], post_bat, post_field,
         rev.get("reviewType"), rev.get("challengeTeamId"),
         rev.get("isOverturned"), rev.get("inProgress"),
     )
 
 
-def _play_rows(play: dict, pk: int, date: str, pid: int | None) -> Iterator[tuple]:
+def _play_rows(play: dict, pk: int, game: _Game, teams: tuple[str, str],
+               pid: int | None, pre: tuple, post: tuple) -> Iterator[tuple]:
     """Yield one row per tracked pitch in a single plate appearance."""
-    head = _play_head(play, pk, date, pid)
+    head = _play_head(play, pk, game, teams, pid, pre, post)
     for e in play.get("playEvents", ()):
         pit = e.get("pitchData")
         if not pit:                      # skips IBB / timer-violation phantoms
@@ -334,13 +393,22 @@ def _play_rows(play: dict, pk: int, date: str, pid: int | None) -> Iterator[tupl
         )
 
 
-def _game_rows(blob: bytes, pk: int, date: str,
+def _game_rows(blob: bytes, pk: int, game: _Game, teams: tuple[str, str],
                pitcher_id: int | None) -> Iterator[tuple]:
-    """Yield rows for one game, optionally limited to a single pitcher."""
+    """Yield rows for one game, optionally limited to a single pitcher.
+
+    The API reports the score *after* each play, so the pre-play score is the
+    previous play's result. Every play is walked, filtered or not, to keep
+    that running total right.
+    """
+    pre = (0, 0)
     for play in orjson.loads(blob).get("allPlays", ()):
+        res = play.get("result", {})
+        post = (res.get("awayScore", pre[0]), res.get("homeScore", pre[1]))
         pid = play.get("matchup", {}).get("pitcher", {}).get("id")
         if pitcher_id is None or pid == pitcher_id:
-            yield from _play_rows(play, pk, date, pid)
+            yield from _play_rows(play, pk, game, teams, pid, pre, post)
+        pre = post
 
 
 def _check_columns(columns) -> None:
@@ -400,7 +468,7 @@ def _cast(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _collect(s: requests.Session, games: dict[int, str], pitcher_id: int | None,
+def _collect(s: requests.Session, games: dict[int, _Game], pitcher_id: int | None,
              workers: int, columns=None) -> pd.DataFrame:
     """Fetch each game's playByPlay in parallel and flatten to a DataFrame."""
     _check_columns(columns)
@@ -415,9 +483,10 @@ def _collect(s: requests.Session, games: dict[int, str], pitcher_id: int | None,
     with ThreadPoolExecutor(max_workers=workers) as ex:
         blobs = list(zip(games, ex.map(fetch, games), strict=True))
 
+    teams = _team_names(s, games)
     rows = [row
             for pk, blob in blobs
-            for row in _game_rows(blob, pk, games[pk], pitcher_id)]
+            for row in _game_rows(blob, pk, games[pk], teams[pk], pitcher_id)]
     df = pd.DataFrame(rows, columns=_COLS)
     if df.empty:
         return _select(df, columns)
@@ -510,7 +579,7 @@ def mlb_day(date: str, *, game_type: str = "R", workers: int = 12,
 
 
 def _one_game(s: requests.Session, pid: int, game_pk: int | None,
-              game_date: str | None, game_type: str) -> dict[int, str]:
+              game_date: str | None, game_type: str) -> dict[int, _Game]:
     """Resolve exactly one game for a pitcher, by gamePk or by date."""
     if game_pk is not None:
         found = _schedule(s, {"gamePk": int(game_pk)})
@@ -518,8 +587,8 @@ def _one_game(s: requests.Session, pid: int, game_pk: int | None,
             raise NotFound(f"no completed game with gamePk {game_pk}")
         return found
     season = int(str(game_date)[:4])
-    games = {pk: d for pk, d in _pitcher_games(s, pid, season, game_type).items()
-             if d == str(game_date)}
+    games = {pk: g for pk, g in _pitcher_games(s, pid, season, game_type).items()
+             if g.date == str(game_date)}
     if not games:
         raise NotFound(f"pitcher {pid} did not appear on {game_date}")
     return games
@@ -538,7 +607,7 @@ def pitcher_game(pitcher: str | int, *, game_pk: int | None = None,
     df = _collect(s, games, pid, workers, columns)
     first = next(iter(games))
     df.attrs.update(scope="pitcher_game", pitcher_id=pid, pitcher_name=full,
-                    game_pk=first, game_date=games[first], game_type=game_type)
+                    game_pk=first, game_date=games[first].date, game_type=game_type)
     return df
 
 
