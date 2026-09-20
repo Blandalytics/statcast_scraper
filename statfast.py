@@ -5,6 +5,7 @@ Four pull modes, all sharing one fetch/flatten core:
     mlb_season(2024)                                 every pitch in a season
     pitcher_season("Tarik Skubal", [2023, 2024])     one pitcher, one/many seasons
     pitcher_game("Skubal", game_date="2024-06-01")   one pitcher, one game
+    batter_season / batter_game                      the same, filtered on the batter
     mlb_day("2024-06-01")                            every pitch on a date
 
 The season pulls also take start=/end= dates instead of seasons. Dates accept
@@ -71,6 +72,8 @@ _FIELDS = ",".join(_names("""
 _SCHED_FIELDS = "dates,date,games,gamePk,status,codedGameState,teams,home,away,team,id"
 # The schedule endpoint has no "P"; postseason is WC/DS/LCS/WS. gameLog does accept "P".
 _POSTSEASON = "F,D,L,W"
+# A pull is filtered on one side of the matchup; this maps the role to its gameLog group.
+_GROUP = {"pitcher": "pitching", "batter": "hitting"}
 
 # Play-level fields, repeated for every pitch in the plate appearance.
 _PLAY_COLS = _names("""
@@ -262,26 +265,26 @@ def _mlb_games(s: Sess, seasons, start, end, game_type: str) -> Games:
     return _in_range(games, start, end)
 
 
-def _pitcher_span_games(s: Sess, pid: int, seasons, start, end, game_type: str) -> Games:
-    """Every game the pitcher appeared in across the requested span."""
+def _player_span_games(s: Sess, pid: int, seasons, start, end, game_type: str, role: str) -> Games:
+    """Every game the player appeared in, as pitcher or batter, across the requested span."""
     years = _seasons(seasons) if seasons is not None else _years(start, end)
     games: Games = {}
     for year in years:
-        games |= _pitcher_games(s, pid, year, game_type)
+        games |= _player_games(s, pid, year, game_type, role)
     return _in_range(games, start, end)
 
 
 def _split_game(sp: dict) -> _Game:
-    """Build a _Game from a gameLog split; `team` is the pitcher's own club."""
+    """Build a _Game from a gameLog split; `team` is the player's own club."""
     own, opp = sp["team"]["id"], sp["opponent"]["id"]
     home, away = (own, opp) if sp.get("isHome") else (opp, own)
     return _Game(sp["date"], home, away)
 
 
-def _pitcher_games(s: Sess, pitcher_id: int, season: int, game_type: str) -> Games:
-    """gamePk -> _Game for every game a pitcher appeared in."""
-    params = {"stats": "gameLog", "group": "pitching", "season": season, "gameType": game_type}
-    log = s.get(f"{API}/people/{pitcher_id}/stats", params=params, timeout=30).json()
+def _player_games(s: Sess, pid: int, season: int, game_type: str, role: str) -> Games:
+    """gamePk -> _Game for every game a player appeared in, in the given role."""
+    params = {"stats": "gameLog", "group": _GROUP[role], "season": season, "gameType": game_type}
+    log = s.get(f"{API}/people/{pid}/stats", params=params, timeout=30).json()
     splits = log["stats"][0]["splits"] if log.get("stats") else []
     return {sp["game"]["gamePk"]: _split_game(sp) for sp in splits}
 
@@ -397,17 +400,16 @@ def _play_rows(play: dict, pk: int, game: _Game, teams: tuple, pid: int | None, 
         # fmt: on
 
 
-def _game_rows(blob: bytes, pk: int, game: _Game, teams: tuple, pitcher_id: int | None) -> Rows:
-    """Yield rows for one game, optionally limited to a single pitcher. The API reports the
-    score *after* each play, so the pre-play score is the previous play's result; every play
-    is walked, filtered or not, to keep that running total right."""
+def _game_rows(blob: bytes, pk: int, game: _Game, teams: tuple, role: str, who: int | None) -> Rows:
+    """Yield rows for one game, optionally limited to one pitcher or batter (``who``). The API
+    reports the score *after* each play, so the pre-play score is the previous play's result;
+    every play is walked, filtered or not, to keep that running total right."""
     pre = (0, 0)
     for play in orjson.loads(blob).get("allPlays", ()):
-        res = play.get("result", {})
+        res, mu = play.get("result", {}), play.get("matchup", {})
         post = (res.get("awayScore", pre[0]), res.get("homeScore", pre[1]))
-        pid = play.get("matchup", {}).get("pitcher", {}).get("id")
-        if pitcher_id is None or pid == pitcher_id:
-            yield from _play_rows(play, pk, game, teams, pid, pre, post)
+        if who is None or mu.get(role, {}).get("id") == who:
+            yield from _play_rows(play, pk, game, teams, mu.get("pitcher", {}).get("id"), pre, post)
         pre = post
 
 
@@ -498,13 +500,13 @@ def _fetch_all(s: Sess, games: Games, workers: int) -> Iterator[tuple[int, bytes
 
 
 def _chunk_frames(
-    s: Sess, games: Games, teams: Teams, pid: int | None, workers: int, columns
+    s: Sess, games: Games, teams: Teams, role: str, who: int | None, workers: int, columns
 ) -> Iterator[pd.DataFrame]:
     """Flatten games in chunks, yielding a fully compacted frame per chunk, so one chunk's
     row tuples are the only Python-object-heavy state alive at a time."""
     for batch in batched(_fetch_all(s, games, workers), _CHUNK_GAMES):
         rows = [
-            row for pk, blob in batch for row in _game_rows(blob, pk, games[pk], teams[pk], pid)
+            r for pk, blob in batch for r in _game_rows(blob, pk, games[pk], teams[pk], role, who)
         ]
         if rows:
             df = pd.DataFrame(rows, columns=_ROW_COLS)
@@ -512,12 +514,15 @@ def _chunk_frames(
             yield _categorize(_cast_values(_narrow(df, columns)))
 
 
-def _collect(s: Sess, games: Games, pid: int | None, workers: int, columns=None) -> pd.DataFrame:
+def _collect(
+    s: Sess, games: Games, who: int | None, workers: int, columns=None, role: str = "pitcher"
+) -> pd.DataFrame:
     """Fetch each game's playByPlay in parallel and flatten to a DataFrame."""
     _check_columns(columns)
     if not games:
         return _select(pd.DataFrame(columns=_COLS), columns)
-    frames = list(_chunk_frames(s, games, _team_names(s, games), pid, workers, columns))
+    teams = _team_names(s, games)
+    frames = list(_chunk_frames(s, games, teams, role, who, workers, columns))
     if not frames:
         return _select(pd.DataFrame(columns=_COLS), columns)
     df = _concat(frames)
@@ -535,10 +540,14 @@ def _person(s: Sess, pid: int) -> tuple[int, str]:
     return pid, people[0]["fullName"]
 
 
-def resolve_pitcher(
-    name: str | int, season: int | None = None, session: Sess | None = None
-) -> tuple[int, str]:
-    """Resolve a pitcher name (or a raw MLBAM id) to ``(id, full_name)``."""
+def _fits(role: str, pos: str | None) -> bool:
+    """Does a primary position fit the role? Two-way players (TWP) fit both."""
+    return pos in ("P", "TWP") if role == "pitcher" else pos != "P"
+
+
+def _resolve(name: str | int, role: str, season: int | None, session: Sess | None):
+    """Resolve a player name (or a raw MLBAM id) to ``(id, full_name)``, preferring
+    candidates whose position fits the role when the name is shared."""
     s = session or _session()
     if isinstance(name, int) or str(name).isdigit():
         return _person(s, int(name))
@@ -546,12 +555,26 @@ def resolve_pitcher(
     hits = s.get(f"{API}/people/search", params=params, timeout=30).json().get("people", [])
     if not hits:
         raise NotFound(f"no MLB player matching {name!r}")
-    pool = [p for p in hits if p.get("primaryPosition", {}).get("abbreviation") in ("P", "TWP")]
+    pool = [p for p in hits if _fits(role, p.get("primaryPosition", {}).get("abbreviation"))]
     pool = pool or hits
     if len(pool) > 1:
         opts = ", ".join(f"{p['fullName']} ({p['id']})" for p in pool[:10])
         raise NotFound(f"{name!r} is ambiguous - pass an id. Candidates: {opts}")
     return pool[0]["id"], pool[0]["fullName"]
+
+
+def resolve_pitcher(
+    name: str | int, season: int | None = None, session: Sess | None = None
+) -> tuple[int, str]:
+    """Resolve a pitcher name (or a raw MLBAM id) to ``(id, full_name)``."""
+    return _resolve(name, "pitcher", season, session)
+
+
+def resolve_batter(
+    name: str | int, season: int | None = None, session: Sess | None = None
+) -> tuple[int, str]:
+    """Resolve a batter name (or a raw MLBAM id) to ``(id, full_name)``."""
+    return _resolve(name, "batter", season, session)
 
 
 # ---- pull modes ---------------------------------------------------------------------
@@ -574,6 +597,19 @@ def mlb_season(
     return df
 
 
+def _player_season(role, player, seasons, start, end, game_type, workers, columns, session):
+    start, end = _check_span(seasons, start, end)
+    s = session or _session(workers)
+    pid, full = _resolve(player, role, None, s)
+    games = _player_span_games(s, pid, seasons, start, end, game_type, role)
+    df = _collect(s, games, pid, workers, columns, role)
+    df.attrs.update({"scope": f"{role}_season", f"{role}_id": pid, f"{role}_name": full})
+    df.attrs.update(
+        span=_span_label(seasons, start, end), start=start, end=end, game_type=game_type
+    )
+    return df
+
+
 def pitcher_season(
     pitcher: str | int,
     seasons: int | Iterable[int] | None = None,
@@ -586,15 +622,26 @@ def pitcher_season(
     session: Sess | None = None,
 ) -> pd.DataFrame:
     """Every tracked pitch by one pitcher, in whole seasons or between dates."""
-    start, end = _check_span(seasons, start, end)
-    s = session or _session(workers)
-    pid, full = resolve_pitcher(pitcher, session=s)
-    games = _pitcher_span_games(s, pid, seasons, start, end, game_type)
-    df = _collect(s, games, pid, workers, columns)
-    span = _span_label(seasons, start, end)
-    df.attrs.update(scope="pitcher_season", pitcher_id=pid, pitcher_name=full, span=span)
-    df.attrs.update(start=start, end=end, game_type=game_type)
-    return df
+    return _player_season(
+        "pitcher", pitcher, seasons, start, end, game_type, workers, columns, session
+    )
+
+
+def batter_season(
+    batter: str | int,
+    seasons: int | Iterable[int] | None = None,
+    *,
+    start: DateLike | None = None,
+    end: DateLike | None = None,
+    game_type: str = "R",
+    workers: int = 12,
+    columns: Iterable[str] | None = None,
+    session: Sess | None = None,
+) -> pd.DataFrame:
+    """Every tracked pitch to one batter, in whole seasons or between dates."""
+    return _player_season(
+        "batter", batter, seasons, start, end, game_type, workers, columns, session
+    )
 
 
 def mlb_day(
@@ -614,20 +661,33 @@ def mlb_day(
 
 
 def _one_game(
-    s: Sess, pid: int, game_pk: int | None, game_date: DateLike | None, game_type: str
+    s: Sess, pid: int, game_pk: int | None, game_date, game_type: str, role: str = "pitcher"
 ) -> Games:
-    """Resolve exactly one game for a pitcher, by gamePk or by date."""
+    """Resolve exactly one game for a player, by gamePk or by date."""
     if game_pk is not None:
         found = _schedule(s, {"gamePk": int(game_pk)})
         if not found:
             raise NotFound(f"no completed game with gamePk {game_pk}")
         return found
     game_date = _date(game_date)
-    games = _pitcher_games(s, pid, int(game_date[:4]), game_type)
+    games = _player_games(s, pid, int(game_date[:4]), game_type, role)
     games = {pk: g for pk, g in games.items() if g.date == game_date}
     if not games:
-        raise NotFound(f"pitcher {pid} did not appear on {game_date}")
+        raise NotFound(f"{role} {pid} did not appear on {game_date}")
     return games
+
+
+def _player_game(role, player, game_pk, game_date, game_type, workers, columns, session):
+    if (game_pk is None) == (game_date is None):
+        raise ValueError("pass exactly one of game_pk= or game_date=")
+    s = session or _session(workers)
+    pid, full = _resolve(player, role, None, s)
+    games = _one_game(s, pid, game_pk, game_date, game_type, role)
+    df = _collect(s, games, pid, workers, columns, role)
+    first = next(iter(games))
+    df.attrs.update({"scope": f"{role}_game", f"{role}_id": pid, f"{role}_name": full})
+    df.attrs.update(game_pk=first, game_date=games[first].date, game_type=game_type)
+    return df
 
 
 def pitcher_game(
@@ -641,23 +701,30 @@ def pitcher_game(
     session: Sess | None = None,
 ) -> pd.DataFrame:
     """Every tracked pitch by one pitcher in a single game (by gamePk or date)."""
-    if (game_pk is None) == (game_date is None):
-        raise ValueError("pass exactly one of game_pk= or game_date=")
-    s = session or _session(workers)
-    pid, full = resolve_pitcher(pitcher, session=s)
-    games = _one_game(s, pid, game_pk, game_date, game_type)
-    df = _collect(s, games, pid, workers, columns)
-    first = next(iter(games))
-    df.attrs.update(scope="pitcher_game", pitcher_id=pid, pitcher_name=full, game_pk=first)
-    df.attrs.update(game_date=games[first].date, game_type=game_type)
-    return df
+    return _player_game(
+        "pitcher", pitcher, game_pk, game_date, game_type, workers, columns, session
+    )
+
+
+def batter_game(
+    batter: str | int,
+    *,
+    game_pk: int | None = None,
+    game_date: DateLike | None = None,
+    game_type: str = "R",
+    workers: int = 12,
+    columns: Iterable[str] | None = None,
+    session: Sess | None = None,
+) -> pd.DataFrame:
+    """Every tracked pitch to one batter in a single game (by gamePk or date)."""
+    return _player_game("batter", batter, game_pk, game_date, game_type, workers, columns, session)
 
 
 # ---- CLI ----------------------------------------------------------------------------
 def _title(df: pd.DataFrame) -> str:
     at = df.attrs
     when = at.get("date") or at.get("game_date") or at.get("span", "")
-    who = at.get("pitcher_name") or "MLB"
+    who = at.get("pitcher_name") or at.get("batter_name") or "MLB"
     return f"{who} | {at.get('scope', '?')} {when} [{at.get('game_type', 'R')}]"
 
 
@@ -702,25 +769,30 @@ def _build_parser():
     ap = argparse.ArgumentParser(description="Pull pitch-level Statcast data.")
     sub = ap.add_subparsers(dest="mode", required=True)
 
-    def mode(name: str, help: str, pitcher: bool = False, span: bool = False):
+    def mode(name: str, help: str, player: str = "", span: bool = False, game: bool = False):
         p = sub.add_parser(name, parents=[common], help=help)
-        if pitcher:
-            p.add_argument("pitcher", help='name ("Tarik Skubal") or MLBAM id (669373)')
+        if player:
+            p.add_argument(player, help='name ("Tarik Skubal") or MLBAM id (669373)')
         if span:
             p.add_argument("seasons", nargs="*", type=int)
             p.add_argument("--start", help="date (any common form), instead of seasons")
             p.add_argument("--end", help="date (any common form)")
+        if game:
+            g = p.add_mutually_exclusive_group(required=True)
+            g.add_argument("--date", help="date (any common form)")
+            g.add_argument("--pk", type=int, help="gamePk")
         return p
 
     p = mode("mlb-season", "all pitches, by season or date range", span=True)
     p.set_defaults(run=lambda a: mlb_season(a.seasons or None, **_kw(a)))
-    p = mode("pitcher-season", "one pitcher, by season or date range", pitcher=True, span=True)
+    p = mode("pitcher-season", "one pitcher, by season or date range", "pitcher", span=True)
     p.set_defaults(run=lambda a: pitcher_season(a.pitcher, a.seasons or None, **_kw(a)))
-    p = mode("pitcher-game", "one pitcher, one game", pitcher=True)
-    g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument("--date", help="date (any common form)")
-    g.add_argument("--pk", type=int, help="gamePk")
+    p = mode("batter-season", "one batter, by season or date range", "batter", span=True)
+    p.set_defaults(run=lambda a: batter_season(a.batter, a.seasons or None, **_kw(a)))
+    p = mode("pitcher-game", "one pitcher, one game", "pitcher", game=True)
     p.set_defaults(run=lambda a: pitcher_game(a.pitcher, game_pk=a.pk, game_date=a.date, **_kw(a)))
+    p = mode("batter-game", "one batter, one game", "batter", game=True)
+    p.set_defaults(run=lambda a: batter_game(a.batter, game_pk=a.pk, game_date=a.date, **_kw(a)))
     p = mode("mlb-day", "all pitches on one date")
     p.add_argument("date", help="date (any common form)")
     p.set_defaults(run=lambda a: mlb_day(a.date, **_kw(a)))
