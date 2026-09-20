@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from itertools import batched
 from typing import NamedTuple
 
+import numpy as np
 import orjson
 import pandas as pd
 import requests
@@ -95,7 +96,8 @@ _PITCH_COLS = _names("""
     break_angle break_length break_y break_vertical ivb hb release_spin_rate spin_axis
     launch_speed launch_angle hit_distance trajectory hardness hit_location hit_coord_x hit_coord_y
 """)
-_COLS = _PLAY_COLS + _PITCH_COLS
+_ROW_COLS = _PLAY_COLS + _PITCH_COLS  # what _play_rows yields
+_COLS = _ROW_COLS + ("spray_angle",)  # plus columns derived after the frame is built
 #: Every column a pull can return, in default order; pass any subset as ``columns=``.
 COLUMNS = _COLS
 # Needed to order the result; materialised even when not requested.
@@ -107,6 +109,7 @@ _F32 = _names("""
     plate_x plate_z pfx_x pfx_z vx0 vy0 vz0 ax ay az release_pos_x release_pos_y release_pos_z
     pitch_coord_x pitch_coord_y break_angle break_length break_y break_vertical ivb hb
     release_spin_rate spin_axis launch_speed launch_angle hit_distance hit_coord_x hit_coord_y
+    spray_angle
 """)
 _U8 = _names("""
     balls strikes outs inning pitch_number zone event_index captivating_index rbi disengagement_num
@@ -311,6 +314,20 @@ def _sides(top: bool, away, home) -> tuple:
     return (away, home) if top else (home, away)
 
 
+# Home plate in the Gameday hit-chart pixel system (identical to Savant hc_x/hc_y). With this
+# origin the foul lines fall at exactly +/-45 degrees, so the raw angle needs no rescaling.
+_HOME = (125.42, 198.27)
+
+
+def _spray_angle(df: pd.DataFrame) -> pd.Series:
+    """Horizontal angle of a batted ball, in degrees: 0 is straight-away centre field and the
+    pull side is negative, so the sign is flipped for left-handed hitters."""
+    x = pd.to_numeric(df["hit_coord_x"], errors="coerce") - _HOME[0]
+    y = _HOME[1] - pd.to_numeric(df["hit_coord_y"], errors="coerce")
+    raw = np.degrees(np.arctan2(x, y))
+    return raw.where(df["stand"] != "L", -raw)
+
+
 # ---- fetch + flatten ----------------------------------------------------------------
 def _play_head(play: dict, pk: int, game: _Game, teams: tuple, pid: int | None, pre, post) -> tuple:
     """Play-level values, identical for every pitch in the PA; pre/post are (away, home) scores."""
@@ -490,7 +507,9 @@ def _chunk_frames(
             row for pk, blob in batch for row in _game_rows(blob, pk, games[pk], teams[pk], pid)
         ]
         if rows:
-            yield _categorize(_cast_values(_narrow(pd.DataFrame(rows, columns=_COLS), columns)))
+            df = pd.DataFrame(rows, columns=_ROW_COLS)
+            df["spray_angle"] = _spray_angle(df)
+            yield _categorize(_cast_values(_narrow(df, columns)))
 
 
 def _collect(s: Sess, games: Games, pid: int | None, workers: int, columns=None) -> pd.DataFrame:
